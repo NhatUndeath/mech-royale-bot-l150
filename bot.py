@@ -40,6 +40,9 @@ HIDE_UNTIL = opt("HIDE_UNTIL", 4)
 PEEK = opt("PEEK", False)            # duck behind cover while the gun reloads, then peek back out
 PEEK_R = opt("PEEK_R", 14)           # how far to look for cover (m)
 PEEK_FOES = opt("PEEK_FOES", 4)      # hide from this many of the nearest visible mechs
+BACK_W = opt("BACK_W", 0)            # target bonus (m) for a mech whose back is turned to us (rear hits x1.5)
+LOWHP_W = opt("LOWHP_W", 40)         # target bonus (m) per missing HP fraction
+HOLD = opt("HOLD", True)            # never push toward the target while 2+ mechs are aiming at us
 
 UPGRADE_PREF = ["armor", "plating", "nanites", "gun_rate", "gun_damage", "laser_damage", "laser_charge",
                 "servos", "gun_mag", "gun_velocity", "sensors", "gyros", "reactor", "capacitor", "jets"]
@@ -324,7 +327,11 @@ class Bot:
                 s = d
                 if m["id"] in self.threat and t - self.threat[m["id"]][0] < 4:
                     s -= 60
-                s -= 40 * (1 - (m.get("hp", 1400) / max(1, m.get("max_hp", 1400))))
+                s -= LOWHP_W * (1 - (m.get("hp", 1400) / max(1, m.get("max_hp", 1400))))
+                if BACK_W and m.get("aim"):
+                    to_us = math.atan2(y - m["pos"][1], x - m["pos"][0])
+                    if abs(wrap(m["aim"][0] - to_us)) > math.pi / 2:
+                        s -= BACK_W
                 return s
             if BERSERK:
                 target = max(mechs, key=lambda m: self.threat_value(m, x, y, t))
@@ -454,6 +461,19 @@ class Bot:
                 fx, fy = (math.cos(ty_) * CLOSE_W / 0.6, math.sin(ty_) * CLOSE_W / 0.6) if want_close else (0.0, 0.0)
                 mv = norm2(sx + mv[0] * 0.5 + fx * 0.6, sy + mv[1] * 0.5 + fy * 0.6)
                 mode = "fight"
+                if HOLD:
+                    aiming = 0
+                    for m in mechs:
+                        if m.get("aim") and d2(m["pos"]) < 160:
+                            to_us = math.atan2(y - m["pos"][1], x - m["pos"][0])
+                            if abs(wrap(m["aim"][0] - to_us)) < 0.35:
+                                aiming += 1
+                    if aiming >= 2:
+                        ux, uy = math.cos(ty_), math.sin(ty_)
+                        fwd = mv[0] * ux + mv[1] * uy
+                        if fwd > -0.3:   # drop any push toward the target, drift slightly back
+                            mv = norm2(mv[0] - (fwd + 0.3) * ux, mv[1] - (fwd + 0.3) * uy)
+                        mode = "hold"
             # do not strafe into walls
             if self.nav.ready and not self.nav.free(x + mv[0] * 4, y + mv[1] * 4):
                 self.strafe_sign = -self.strafe_sign

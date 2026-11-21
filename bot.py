@@ -33,11 +33,19 @@ FARM = opt("FARM", True)             # shoot NPC drones and crates when quiet
 DODGE = opt("DODGE", False)          # sidestep lasers aimed at us
 BREAK_LOS = opt("BREAK_LOS", False)  # retreat toward a spot the attacker cannot see
 EDGE = opt("EDGE", 0.5)
-LOOT_EARLY = opt("LOOT_EARLY", 70)   # how far to walk for a weapon in the first 200 s              # where to wait inside the next zone, as a fraction of its radius
+LOOT_EARLY = opt("LOOT_EARLY", 150)
+BERSERK = opt("BERSERK", False)
+CONTEXT = opt("CONTEXT", False)      # detect a free-for-all (others die without us) and hide until the end game
+HIDE_UNTIL = opt("HIDE_UNTIL", 4)
+PEEK = opt("PEEK", False)            # duck behind cover while the gun reloads, then peek back out
+PEEK_R = opt("PEEK_R", 14)           # how far to look for cover (m)
+PEEK_FOES = opt("PEEK_FOES", 4)      # hide from this many of the nearest visible mechs
 
 UPGRADE_PREF = ["armor", "plating", "nanites", "gun_rate", "gun_damage", "laser_damage", "laser_charge",
                 "servos", "gun_mag", "gun_velocity", "sensors", "gyros", "reactor", "capacitor", "jets"]
-WEAPON_PREF = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
+WEAPON_PREF = opt("WEAPON_PREF", {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0})
+CLOSE_DIST = opt("CLOSE_DIST", 35)   # with lightning, close in to this distance
+CLOSE_W = opt("CLOSE_W", 0.6)        # how hard to push in while strafing
 
 
 def wrap(a):
@@ -78,6 +86,21 @@ class Bot:
         self.sound_look = None    # (until, bearing)
         self.prev_t = 0.0
         self.laser_hold = 0.0
+        self.cur_target = None
+        self.peek_from = None     # (x, y, t) where we last shot from before ducking
+        self.peek_until = -1.0
+        self.last_tpos = None
+        self.cover_cache = (-9.0, None, None)
+        self.ffa = False          # evidence that other mechs fight each other
+        self.hiding = False
+        self.prev_alive = None
+        self.my_kill_t = -99.0
+        self.hp_seen = {}         # mech id -> last hp we saw
+        self.my_hit_t = {}        # mech id -> last time we hit it
+        self.ffa_score = 0
+        self.ffa_deaths = 0
+        self.ffa_hits = 0
+        self.dmg_from = {}        # mech id -> list of (time, amount)
 
     # ------------------------------------------------------------------ helpers
     def weapon_slots(self, me):
@@ -100,7 +123,7 @@ class Bot:
             else:
                 ux, uy = norm2(x - nc[0], y - nc[1])
                 g = (nc[0] + ux * r, nc[1] + uy * r)
-            if COVER and self.nav.ready and nr > 20:
+            if (COVER or self.hiding) and self.nav.ready and nr > 20:
                 g = self.nav.cover_spot(nc, (EDGE + 0.05) * nr, g, self.rng) or g
             if self.nav.ready:
                 i, j = self.nav.nearest_free(g[0], g[1], 80, main=True)
@@ -160,6 +183,26 @@ class Bot:
         ang = math.atan2(v * v - math.sqrt(disc), g * x2)
         return math.atan2(ty2 - my, tx2 - mx), ang
 
+    def threat_value(self, m, x, y, t):
+        """How urgent it is to shoot m: its damage rate on us divided by the time we need to kill it."""
+        d = max(1.0, math.dist((x, y), (m["pos"][0], m["pos"][1])))
+        b = math.atan2(y - m["pos"][1], x - m["pos"][0])
+        facing = abs(wrap(m["aim"][0] - b)) < 0.35
+        ws = m.get("weapons") or ["gun"]
+        dps = 0.0
+        if d < 230:
+            dps += 150 if facing else 40
+        if "laser" in ws and d < 280:
+            dps += (260 if m.get("charging") and facing else 110)
+        if "lightning" in ws and d < 50:
+            dps += 200
+        if "mortar" in ws and 20 < d < 230:
+            dps += 70
+        recent = sum(a for (tt, a) in self.dmg_from.get(m["id"], []) if t - tt < 3)
+        dps += recent / 3.0 * 1.5
+        ttk = max(0.5, m.get("hp", 1400) / 160.0) * (1 + d / 250)
+        return dps / ttk
+
     def hide_dir(self, x, y, z, enemy):
         """Direction to the nearest reachable point (within ~25 m) the enemy has no line of sight to."""
         ex, ey, ez = enemy
@@ -177,6 +220,34 @@ class Bot:
                         best = (score, ca, sa)
                     break
         return (best[1], best[2]) if best else None
+
+    def cover_from(self, x, y, z, foes, t):
+        """Direction to the closest reachable point no foe can see (None if none within PEEK_R)."""
+        ct, cpos, cdir = self.cover_cache
+        if t - ct < 0.3 and cpos is not None and math.dist(cpos, (x, y)) < 2:
+            return cdir
+        best = None
+        if foes:
+            # already hidden?
+            if all(not self.nav.los((fx, fy, fz + 7), (x, y, z + 4.5)) for fx, fy, fz in foes):
+                self.cover_cache = (t, (x, y), (0.0, 0.0))
+                return (0.0, 0.0)
+            rs = [r for r in (3, 6, 9, 12, 15, 18, 22, 26, 30) if r <= PEEK_R]
+            for k in range(16):
+                a = k * math.pi / 8
+                ca, sa = math.cos(a), math.sin(a)
+                for r in rs:
+                    px, py = x + ca * r, y + sa * r
+                    if not self.nav.free(px, py):
+                        break
+                    pz = self.nav.ground_h(px, py)
+                    if all(not self.nav.los((fx, fy, fz + 7), (px, py, pz + 5)) for fx, fy, fz in foes):
+                        if best is None or r < best[0]:
+                            best = (r, ca, sa)
+                        break
+        d = (best[1], best[2]) if best else None
+        self.cover_cache = (t, (x, y), d)
+        return d
 
     def aligned(self, me, yaw, pitch, dist, tol_r=2.5):
         ay, ap = me["aim"]
@@ -202,11 +273,37 @@ class Bot:
             best = min(range(len(ids)), key=lambda i: UPGRADE_PREF.index(ids[i]) if ids[i] in UPGRADE_PREF else 99)
             act["pick"] = best
 
+        # free-for-all detection: in practice the house squad never fights itself,
+        # so mechs dying or losing HP without us means a real free-for-all
+        for ev in obs.get("events") or []:
+            if ev["type"] == "kill":
+                self.my_kill_t = t
+            elif ev["type"] == "hit":
+                self.my_hit_t[ev.get("target")] = t
+        alive = obs.get("alive")
+        if CONTEXT and alive is not None:
+            if self.prev_alive is not None and alive < self.prev_alive and t - self.my_kill_t > 1.5:
+                self.ffa_deaths += self.prev_alive - alive
+            for m in obs.get("mechs") or []:
+                if m["kind"] != "mech" or "hp" not in m:
+                    continue
+                old = self.hp_seen.get(m["id"])
+                if (old is not None and t - old[0] < 0.35 and m["hp"] < old[1] - 30
+                        and t - self.my_hit_t.get(m["id"], -99) > 1.0):
+                    self.ffa_hits += 1
+                self.hp_seen[m["id"]] = (t, m["hp"])
+            self.ffa_score = 2 * self.ffa_deaths + self.ffa_hits
+            if self.ffa_deaths >= 3 or (self.ffa_deaths >= 2 and self.ffa_hits >= 3):
+                self.ffa = True
+        self.prev_alive = alive
+        self.hiding = CONTEXT and self.ffa and (alive or 16) > HIDE_UNTIL
+
         # threats from events and sounds
         for ev in obs.get("events") or []:
             if ev["type"] == "damaged" and ev.get("by") is not None and ev.get("bearing") is not None:
                 self.threat[ev["by"]] = (t, ev["bearing"])
                 self.last_hit_t, self.last_hit_bearing = t, ev["bearing"]
+                self.dmg_from.setdefault(ev["by"], []).append((t, ev.get("amount", 0)))
         for s in obs.get("sounds") or []:
             if s["kind"] in ("gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", "jet") and s["dist"] == "near":
                 if self.sound_look is None or self.sound_look[0] < t:
@@ -229,8 +326,18 @@ class Bot:
                     s -= 60
                 s -= 40 * (1 - (m.get("hp", 1400) / max(1, m.get("max_hp", 1400))))
                 return s
-            target = min(mechs, key=score)
+            if BERSERK:
+                target = max(mechs, key=lambda m: self.threat_value(m, x, y, t))
+                # stick with the current target unless another is clearly better
+                cur = next((m for m in mechs if m["id"] == self.cur_target), None)
+                if cur is not None and self.threat_value(cur, x, y, t) > 0.75 * self.threat_value(target, x, y, t):
+                    target = cur
+                self.cur_target = target["id"]
+            else:
+                target = min(mechs, key=score)
         tdist = d2(target["pos"]) if target else 1e9
+        if target is not None:
+            self.last_tpos = (target["pos"][0], target["pos"][1], t)
 
         travel = self.must_travel(obs, me)
         goal = self.zone_goal(obs, me)
@@ -300,13 +407,19 @@ class Bot:
                     s = None  # direct is fine for short hops; walls slide us
                 mv = norm2(gx - x, gy - y)
         boost = not me.get("in_zone", True) or travel and dgoal > 60
+        if PEEK and target is None and self.peek_from is not None and not travel and me.get("in_zone", True):
+            px_, py_, pt_ = self.peek_from
+            if t < self.peek_until:
+                mv, mode = (0.0, 0.0), "duck"
+            elif t - pt_ < 6 and math.dist((x, y), (px_, py_)) > 2:
+                mv, mode = norm2(px_ - x, py_ - y), "peek"
 
         # combat movement: strafe / retreat
         engage = False
         if target is not None:
             their = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
             attacked = target["id"] in self.threat and t - self.threat[target["id"]][0] < 5
-            engage = (not GATE) or attacked or tdist < 60 or (their < 0.35 and hp_frac > 0.6 and tdist < 150)
+            engage = (not (GATE or self.hiding)) or attacked or tdist < 60 or (their < 0.35 and hp_frac > 0.6 and tdist < 150)
             if not engage and tdist < 180:
                 # stay out of it: move away from them, keep facing them
                 ax, ay = norm2(x - target["pos"][0], y - target["pos"][1])
@@ -337,14 +450,26 @@ class Bot:
                 boost = me["energy"] > 25
                 mode = "retreat"
             else:
-                want_close = "lightning" in slots and tdist > 35
-                fx, fy = (math.cos(ty_), math.sin(ty_)) if want_close else (0.0, 0.0)
+                want_close = "lightning" in slots and tdist > CLOSE_DIST
+                fx, fy = (math.cos(ty_) * CLOSE_W / 0.6, math.sin(ty_) * CLOSE_W / 0.6) if want_close else (0.0, 0.0)
                 mv = norm2(sx + mv[0] * 0.5 + fx * 0.6, sy + mv[1] * 0.5 + fy * 0.6)
                 mode = "fight"
             # do not strafe into walls
             if self.nav.ready and not self.nav.free(x + mv[0] * 4, y + mv[1] * 4):
                 self.strafe_sign = -self.strafe_sign
                 self.strafe_until = t + 1.0
+            gun_ = slots.get("gun")
+            rl = gun_[1].get("reload", 0) if gun_ else 0
+            if PEEK and not retreat and self.nav.ready and gun_ and (rl > 0 or gun_[1].get("ammo", 1) == 0):
+                foes = [m["pos"] for m in sorted(mechs, key=lambda m: d2(m["pos"]))[:PEEK_FOES] if d2(m["pos"]) < 160]
+                h = self.cover_from(x, y, z, foes, t)
+                if h is not None:
+                    if self.peek_until < t:
+                        self.peek_from = (x, y, t)
+                    self.peek_until = t + max(rl, 0.3)
+                    mv = norm2(*h) if h != (0.0, 0.0) else (0.0, 0.0)
+                    boost = h != (0.0, 0.0) and me["energy"] > 30
+                    mode = "duck"
         # sidestep a laser being charged at us
         if DODGE:
             for m in mechs:
@@ -410,6 +535,13 @@ class Bot:
             eye = (x, y, z + me["stats"].get("muzzle_height", 7))
             tp = (shoot_at["pos"][0], shoot_at["pos"][1], shoot_at["pos"][2] + 3)
             clear = self.nav.los(eye, tp) if hd < 230 else False
+            dc = self.__dict__.setdefault("dbg_counts", {})
+            dc["tgt"] = dc.get("tgt", 0) + 1
+            dc["aligned"] = dc.get("aligned", 0) + bool(aligned)
+            dc["clear"] = dc.get("clear", 0) + bool(clear)
+            dc["inrange"] = dc.get("inrange", 0) + bool(hd < 230)
+            dc["reloading"] = dc.get("reloading", 0) + bool(gun and gun[1].get("reload", 0) > 0)
+            dc["ok"] = dc.get("ok", 0) + bool(aligned and clear and hd < 230)
             if gun and aligned and clear and hd < gun[1]["stats"].get("range", 230):
                 if gun[1].get("reload", 0) == 0 and gun[1].get("ammo", 1) > 0:
                     fire[gun[0]] = True
@@ -445,6 +577,8 @@ class Bot:
                 look = self.last_hit_bearing
             elif self.sound_look and self.sound_look[0] > t:
                 look = self.sound_look[1]
+            if look is None and PEEK and self.last_tpos is not None and t - self.last_tpos[2] < 6:
+                look = math.atan2(self.last_tpos[1] - y, self.last_tpos[0] - x)
             if look is None:
                 base = math.atan2(mv[1], mv[0]) if mv != (0.0, 0.0) else self.scan_yaw
                 self.scan_yaw = wrap(self.scan_yaw + 1.6 * dt)
@@ -462,7 +596,7 @@ class Bot:
         self.nav.work(max(0.0, 0.010 - (time.perf_counter() - t_start)))
         # debug record (only our team can download it): enough to rebuild why we die
         w1 = me["weapons"][1]["kind"] if me["weapons"][1] else "-"
-        mf.draw.label(f"{mode} hp{me['hp']:.0f}/{me['max_hp']:.0f} e{me['energy']:.0f} {w1} "
+        mf.draw.label(f"{'H' if self.hiding else ('F' if self.ffa else 'S')} {mode} hp{me['hp']:.0f}/{me['max_hp']:.0f} e{me['energy']:.0f} {w1} "
                       f"T{target['id'] if target else '-'}@{tdist if target else 0:.0f} n{len(mechs)} st{self.stuck_t:.1f}")
         if self.goal:
             mf.draw.line([x, y, z + 2], [self.goal[0], self.goal[1], z + 2], "#40c0ff")

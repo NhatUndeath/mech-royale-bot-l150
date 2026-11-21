@@ -42,6 +42,12 @@ PEEK_R = opt("PEEK_R", 14)           # how far to look for cover (m)
 PEEK_FOES = opt("PEEK_FOES", 4)      # hide from this many of the nearest visible mechs
 BACK_W = opt("BACK_W", 0)            # target bonus (m) for a mech whose back is turned to us (rear hits x1.5)
 LOWHP_W = opt("LOWHP_W", 40)         # target bonus (m) per missing HP fraction
+FARM_R = opt("FARM_R", 200)           # how far to look for crates / drones to farm
+CUBE_R = opt("CUBE_R", 200)           # how far to walk for a cube
+FARM_MOVE = opt("FARM_MOVE", True)  # walk up to far crates / drones instead of only shooting what is near
+FARM_T = opt("FARM_T", 400)          # stop farming after this time
+DROP_R = opt("DROP_R", 300)           # how far to go for a supply drop
+DROP_EARLY = opt("DROP_EARLY", 25)    # start walking to a drop this many seconds before it lands
 HOLD = opt("HOLD", True)            # never push toward the target while 2+ mechs are aiming at us
 
 UPGRADE_PREF = ["armor", "plating", "nanites", "gun_rate", "gun_damage", "laser_damage", "laser_charge",
@@ -93,6 +99,7 @@ class Bot:
         self.peek_from = None     # (x, y, t) where we last shot from before ducking
         self.peek_until = -1.0
         self.last_tpos = None
+        self.mem_farm = {}        # id -> (x, y, z, kind, last seen t): crates and drones we have seen
         self.cover_cache = (-9.0, None, None)
         self.ffa = False          # evidence that other mechs fight each other
         self.hiding = False
@@ -315,6 +322,18 @@ class Bot:
         mechs = [m for m in obs.get("mechs") or [] if m["kind"] == "mech"]
         npcs = [m for m in obs.get("mechs") or [] if m["kind"] == "npc"]
         slots = self.weapon_slots(me)
+        if FARM_MOVE:
+            seen_ids = set()
+            for c in obs.get("crates") or []:
+                self.mem_farm[c["id"]] = (c["pos"][0], c["pos"][1], c["pos"][2], "crate", t)
+                seen_ids.add(c["id"])
+            for n in npcs:
+                self.mem_farm[n["id"]] = (n["pos"][0], n["pos"][1], n["pos"][2], "npc", t)
+                seen_ids.add(n["id"])
+            for k in list(self.mem_farm):
+                fx_, fy_, _, kd_, ft_ = self.mem_farm[k]
+                if k not in seen_ids and (math.dist((x, y), (fx_, fy_)) < 30 or t - ft_ > (90 if kd_ == "npc" else 400)):
+                    del self.mem_farm[k]
 
         def d2(p):
             return math.dist((x, y), (p[0], p[1]))
@@ -370,7 +389,7 @@ class Bot:
                     continue
                 if d2(p["pos"]) < (LOOT_EARLY if t < 200 else 70):
                     picks.append(p)
-            cubes = [c for c in obs.get("cubes") or [] if d2(c["pos"]) < 60 and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
+            cubes = [c for c in obs.get("cubes") or [] if d2(c["pos"]) < CUBE_R and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
             if picks:
                 p = min(picks, key=lambda p: d2(p["pos"]))
                 move_to, mode = (p["pos"][0], p["pos"][1]), "loot"
@@ -384,19 +403,31 @@ class Bot:
                 c = min(cubes, key=lambda c: d2(c["pos"]))
                 move_to, mode = (c["pos"][0], c["pos"][1]), "cube"
             # farm NPC drones (2 cubes) and crates (1 cube + maybe a weapon) while it is quiet
-            if FARM and t < 260 and hp_frac > 0.6 and not mechs:
-                npc_c = [n for n in npcs if d2(n["pos"]) < 70]
-                crates = [c for c in obs.get("crates") or [] if d2(c["pos"]) < 70
+            if FARM and t < FARM_T and hp_frac > 0.6 and not mechs:
+                npc_c = [n for n in npcs if d2(n["pos"]) < FARM_R]
+                crates = [c for c in obs.get("crates") or [] if d2(c["pos"]) < FARM_R
                           and abs(c["pos"][2] - self.nav.ground_h(c["pos"][0], c["pos"][1])) < 3]
                 if npc_c:
                     farm_target = dict(min(npc_c, key=lambda n: d2(n["pos"])))
                 elif crates and mode == "zone":
                     c = min(crates, key=lambda c: d2(c["pos"]))
                     farm_target = {"kind": "crate", "pos": c["pos"], "vel": [0, 0, 0], "id": c["id"]}
+                if FARM_MOVE and farm_target is not None and mode == "zone":
+                    keep = 38 if farm_target.get("kind") == "npc" else 20
+                    if d2(farm_target["pos"]) > keep:
+                        move_to, mode = (farm_target["pos"][0], farm_target["pos"][1]), "farm"
+                elif FARM_MOVE and farm_target is None and mode == "zone" and self.mem_farm:
+                    zc = obs["zone"]
+                    cand = [(d2(v), v) for v in self.mem_farm.values()
+                            if d2(v) < FARM_R and math.dist((v[0], v[1]), zc["next_center"]) < zc["next_radius"] * 0.9
+                            and abs(v[2] - self.nav.ground_h(v[0], v[1])) < 3]
+                    if cand:
+                        v = min(cand, key=lambda c: c[0])[1]
+                        move_to, mode = (v[0], v[1]), "farm"
         # supply drop: only if very close and nobody around
-        if safe and mode == "zone" and not mechs:
+        if not travel and nearest_mech > 90 and mode in ("zone", "farm", "cube") and not mechs:
             for dr in obs.get("drops") or []:
-                if dr["lands_in"] <= 3 and d2(dr["pos"]) < 70 and (dr.get("holder") in (None, me["id"])):
+                if dr["lands_in"] <= DROP_EARLY and d2(dr["pos"]) < DROP_R and (dr.get("holder") in (None, me["id"])):
                     move_to, mode = (dr["pos"][0], dr["pos"][1]), "drop"
 
         # ---------------- movement
@@ -532,6 +563,16 @@ class Bot:
         if not me.get("grounded") and me["energy"] > 15 and self.stuck_t > 0.3:
             boost = True
 
+        mc_ = self.__dict__.setdefault("mode_counts", {})
+        mc_[mode] = mc_.get(mode, 0) + 1
+        if farm_target is not None:
+            mc_["farm_tgt"] = mc_.get("farm_tgt", 0) + 1
+        if safe:
+            mc_["safe"] = mc_.get("safe", 0) + 1
+        if t < 120:
+            mc_["early"] = mc_.get("early", 0) + 1
+            if mechs:
+                mc_["early_seen"] = mc_.get("early_seen", 0) + 1
         act["move"] = [round(mv[0], 3), round(mv[1], 3)]
         act["boost"] = bool(boost)
 
